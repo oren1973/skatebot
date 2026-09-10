@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SkateCoachBot — טלגרם בוט לתחקיר סקייטבורד
+SkateCoachBot — webhook mode for Render free tier
 """
 
 import os
@@ -8,15 +8,21 @@ import math
 import base64
 import tempfile
 import subprocess
+import json
+import logging
 from pathlib import Path
 
 import anthropic
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from aiohttp import web
+
+logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # Render מספק את זה אוטומטית
 
 ANALYSIS_PROMPT = """אתה מאמן סקייטבורד מנוסה. לפניך פריימים ממוספרים מסרטון של גולש.
 
@@ -47,7 +53,7 @@ ANALYSIS_PROMPT = """אתה מאמן סקייטבורד מנוסה. לפניך �
   ]
 }
 
-שדה "frame" הוא מספר הפריים (מתוך הרשימה שקיבלת) שבו ההערה הכי נראית בבירור."""
+שדה "frame" הוא מספר הפריים שבו ההערה הכי נראית בבירור."""
 
 
 def extract_frames(video_path: str, fps: float = 2, max_frames: int = 16) -> list[str]:
@@ -101,10 +107,8 @@ def annotate_frame(frame_path: str, tip: dict, index: int) -> str:
     colors = [(220, 40, 40, 230), (220, 140, 0, 230), (30, 100, 210, 230)]
     color = colors[index % 3]
 
-    # חלק הכיתוב לשורות
-    title = f"❶❷❸"[index] + " " + tip["title"]
+    title = "❶❷❸"[index] + " " + tip["title"]
     body = tip["body"]
-    # חלק body לשורות של ~30 תווים
     words = body.split(" ")
     lines = [title]
     current = ""
@@ -117,18 +121,13 @@ def annotate_frame(frame_path: str, tip: dict, index: int) -> str:
     if current:
         lines.append(current.strip())
 
-    # מיקום bubble — לסירוגין: ימין-למעלה, שמאל-למטה, ימין-למטה
     positions = [(W - 270, 40), (8, H - 180), (W - 270, H - 180)]
     bx, by = positions[index % 3]
 
     bx1, by1, bx2, by2 = bubble(d, bx, by, lines, color, W, H)
-
-    # מרכז הבועה
     cx = (bx1 + bx2) // 2
     cy = (by1 + by2) // 2
-    # מרכז הגולש (בערך אמצע הפריים)
-    sx, sy = W // 2, H // 2
-    arrow(d, cx, cy, sx, sy, color)
+    arrow(d, cx, cy, W // 2, H // 2, color)
 
     result = Image.alpha_composite(img, ov).convert("RGB")
     out_path = frame_path.replace(".jpg", f"_tip{index}.jpg")
@@ -151,9 +150,7 @@ def analyze_frames(frame_paths: list[str]) -> dict:
         max_tokens=1024,
         messages=[{"role": "user", "content": content}]
     )
-    import json
     text = msg.content[0].text.strip()
-    # נקה אם יש ```json
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -163,51 +160,71 @@ def analyze_frames(frame_paths: list[str]) -> dict:
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    await msg.reply_text("🛹 קיבלתי! מוריד ומנתח את הסרטון — זה לוקח כ-30 שניות...")
+    await msg.reply_text("🛹 קיבלתי! מנתח את הסרטון — כ-30 שניות...")
 
-    # הורד וידאו
     video = msg.video or msg.document
     file = await context.bot.get_file(video.file_id)
     tmpdir = tempfile.mkdtemp(prefix="skatebot_")
     video_path = os.path.join(tmpdir, "input.mp4")
     await file.download_to_drive(video_path)
 
-    await msg.reply_text("📸 מוציא פריימים...")
     frames = extract_frames(video_path)
-
     if not frames:
-        await msg.reply_text("❌ לא הצלחתי לפרק את הסרטון. נסה שוב.")
+        await msg.reply_text("❌ לא הצלחתי לפרק את הסרטון.")
         return
 
-    await msg.reply_text("🤖 מנתח עם Claude...")
     result = analyze_frames(frames)
     tips = result.get("tips", [])
-
     if not tips:
-        await msg.reply_text("❌ לא הצלחתי לנתח. נסה עם סרטון אחר.")
+        await msg.reply_text("❌ לא הצלחתי לנתח.")
         return
 
-    # שלח סיכום טקסט
     summary = "🛹 *תחקיר — 3 דברים לשיפור:*\n\n"
     for i, tip in enumerate(tips[:3]):
         summary += f"{'❶❷❸'[i]} *{tip['title']}*\n{tip['body']}\n\n"
     await msg.reply_text(summary, parse_mode="Markdown")
 
-    # שלח 3 תמונות מוערות
     for i, tip in enumerate(tips[:3]):
-        frame_idx = min(tip.get("frame", 1) - 1, len(frames) - 1)
-        frame_idx = max(0, frame_idx)
+        frame_idx = max(0, min(tip.get("frame", 1) - 1, len(frames) - 1))
         annotated = annotate_frame(frames[frame_idx], tip, i)
         with open(annotated, "rb") as f:
             await msg.reply_photo(f)
 
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    print("🛹 SkateCoachBot מתחיל...")
-    app.run_polling()
+
+    webhook_url = f"{RENDER_URL}/{TELEGRAM_TOKEN}"
+    logging.info(f"Setting webhook: {webhook_url}")
+
+    await app.bot.set_webhook(webhook_url)
+
+    # aiohttp server לקבלת webhook
+    async def handle_webhook(request):
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+        return web.Response(text="OK")
+
+    async def handle_health(request):
+        return web.Response(text="OK")
+
+    await app.initialize()
+    server = web.Application()
+    server.router.add_post(f"/{TELEGRAM_TOKEN}", handle_webhook)
+    server.router.add_get("/", handle_health)
+
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000)))
+    await site.start()
+    logging.info("🛹 SkateCoachBot רץ בmodus webhook")
+
+    import asyncio
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
